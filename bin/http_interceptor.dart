@@ -2,9 +2,28 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+const bool handleCors = true;
 const String host = '127.0.0.1';
 const int targetPort = 11434;
 const int sourcePort = 11435;
+
+HttpServer? server;
+
+class OutData {
+  final String filePath;
+  final StringBuffer buffer = StringBuffer();
+
+  OutData(this.filePath);
+
+  void write() {
+    File(filePath)
+      ..createSync(recursive: true)
+      ..writeAsStringSync(buffer.toString());
+  }
+}
+
+OutData? outData;
+bool closeHandlerInvoked = false;
 
 Uint8List combineLists(List<Uint8List> lists) {
   final length = lists.fold<int>(0, (prev, element) => prev + element.length);
@@ -19,34 +38,76 @@ Uint8List combineLists(List<Uint8List> lists) {
   return result;
 }
 
-Future<void> main() async {
-  final server = await HttpServer.bind(InternetAddress.anyIPv4, sourcePort);
+void _closeHandler(final ProcessSignal signal) {
+  if (closeHandlerInvoked) return;
+  closeHandlerInvoked = true;
+
+  print('Received signal $signal');
+
+  if (outData != null) {
+    print('File Output enabled to ${outData!.filePath} - writing now...');
+
+    final OutData outDataCopy = outData!;
+    outData = null;
+
+    outDataCopy.write();
+
+    print('File written');
+  }
+
+  server?.close(force: true).then((_) {
+    print('Server closed');
+    exit(0);
+  });
+}
+
+Future<void> main(List<String> args) async {
+  ProcessSignal.sigint.watch().listen(_closeHandler);
+  ProcessSignal.sigterm.watch().listen(_closeHandler);
+
+  server = await HttpServer.bind(InternetAddress.anyIPv4, sourcePort);
+
   print('Listening on port $sourcePort');
 
-  await for (final HttpRequest origRequest in server) {
+  if (args.isNotEmpty) {
+    outData = OutData(args[0]);
+  }
+
+  await for (final HttpRequest origRequest in server!) {
     try {
       // Handle CORS preflight request
-      if (origRequest.method == 'OPTIONS') {
-        origRequest.response
-          ..statusCode = HttpStatus.ok
-          ..headers.add('Access-Control-Allow-Origin', '*')
-          ..headers.add(
-              'Access-Control-Allow-Methods', 'POST, GET, OPTIONS, PUT, DELETE')
-          ..headers.add(
-              'Access-Control-Allow-Headers', 'content-type, authorization')
-          ..close();
+      if (handleCors) {
+        if (origRequest.method == 'OPTIONS') {
+          origRequest.response
+            ..statusCode = HttpStatus.ok
+            ..headers.add('Access-Control-Allow-Origin', '*')
+            ..headers.add('Access-Control-Allow-Methods',
+                'POST, GET, OPTIONS, PUT, DELETE')
+            ..headers.add(
+                'Access-Control-Allow-Headers', 'content-type, authorization')
+            ..close();
 
-        print("CORS request handled");
-        continue;
+          print("CORS request handled");
+          continue;
+        }
       }
 
       // Print the incoming request
-      print('Received request: ${origRequest.method} ${origRequest.uri}');
+      print('Request: ${origRequest.method} ${origRequest.uri}');
       print('Headers: ${origRequest.headers}');
 
       final Uint8List origContent = combineLists(await origRequest.toList());
 
-      print('Body: ${utf8.decode(origContent)}');
+      print('Body: ');
+      print(utf8.decode(origContent));
+
+      // Write to file if enabled
+      outData?.buffer
+          .writeln('Request: ${origRequest.method} ${origRequest.uri}');
+      outData?.buffer.writeln('Headers: ${origRequest.headers}');
+      outData?.buffer.writeln('Body:');
+      outData?.buffer.writeln(utf8.decode(origContent));
+      outData?.buffer.writeln();
 
       // Forward the request to host:targetPort
       final forwardRequest = await HttpClient().openUrl(origRequest.method,
@@ -81,7 +142,16 @@ Future<void> main() async {
       }
 
       // Print
-      print('Body: ${utf8.decode(forwardContent)}');
+      print('Body:');
+      print(utf8.decode(forwardContent));
+
+      // Write to file if enabled
+      outData?.buffer.writeln(
+          'Response from $host:$targetPort: ${forwardResponse.statusCode}');
+      outData?.buffer.writeln('Headers: ${forwardResponse.headers}');
+      outData?.buffer.writeln('Body:');
+      outData?.buffer.writeln(utf8.decode(forwardContent));
+      outData?.buffer.writeln();
 
       // Send the response back to the original client
       origRequest.response.statusCode = forwardResponse.statusCode;
@@ -102,8 +172,11 @@ Future<void> main() async {
           ..statusCode = HttpStatus.internalServerError
           ..write('Internal Server Error')
           ..close();
+
+        _closeHandler(ProcessSignal.sigterm);
       } catch (e, s) {
         print('Error sending error response: $e - $s');
+        _closeHandler(ProcessSignal.sigterm);
       }
     }
   }
